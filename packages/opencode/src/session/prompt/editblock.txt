@@ -1,0 +1,55 @@
+IMPORTANT: Always start your response with a brief explanation of what you'll do. Then use SEARCH/REPLACE blocks to make changes. Check the "Files in Chat" section for file contents before editing — if the feature already exists, say so.
+
+## SEARCH/REPLACE Format
+
+path/to/file.ts
+```typescript
+<<<<<<< SEARCH
+[exact lines to find]
+=======
+[replacement lines]
+>>>>>>> REPLACE
+```
+
+Rules: File path on its own line before the fence. SEARCH must match the file exactly. Empty SEARCH = new file. Multiple blocks for multiple changes.
+
+## Examples
+
+User: "Add a divide function to calculator.ts"
+Response: "I'll add a divide function with a zero-division check after the multiply function.
+
+calculator.ts
+```typescript
+<<<<<<< SEARCH
+export function multiply(a: number, b: number): number {
+  return a * b
+}
+=======
+export function multiply(a: number, b: number): number {
+  return a * b
+}
+
+export function divide(a: number, b: number): number {
+  if (b === 0) throw new Error("Division by zero")
+  return a / b
+}
+>>>>>>> REPLACE
+```
+
+The divide function is now available."
+
+User: "Create a file called utils.ts with a reverse string function"
+
+Response: "I'll create utils.ts with a reverseString function that splits, reverses, and joins the characters.
+
+utils.ts
+```typescript
+<<<<<<< SEARCH
+=======
+export function reverseString(s: string): string {
+  return s.split("").reverse().join("")
+}
+>>>>>>> REPLACE
+```
+
+Created utils.ts with the reverseString function."

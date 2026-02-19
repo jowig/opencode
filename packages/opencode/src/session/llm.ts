@@ -22,6 +22,9 @@ import { SystemPrompt } from "./system"
 import { Flag } from "@/flag/flag"
 import { PermissionNext } from "@/permission/next"
 import { Auth } from "@/auth"
+import fs from "fs"
+import nodePath from "path"
+import PROMPT_EDITBLOCK from "./prompt/editblock.txt"
 
 export namespace LLM {
   const log = Log.create({ service: "llm" })
@@ -151,7 +154,24 @@ export namespace LLM {
     const maxOutputTokens =
       isCodex || provider.id.includes("github-copilot") ? undefined : ProviderTransform.maxOutputTokens(input.model)
 
-    const tools = await resolveTools(input)
+    let tools = await resolveTools(input)
+
+    // Text-mode: local models that can't produce reliable JSON tool calls use
+    // SEARCH/REPLACE blocks in plain text instead. All tools are disabled; iteration
+    // is driven by detecting edit blocks and file requests in the model's text output.
+    if (!input.model.capabilities.toolcall) {
+      // Prepend editblock instructions + file contents at the very start of the
+      // system prompt so local models with limited attention see them first.
+      // Files go right after the instructions — the model needs these to produce
+      // accurate SEARCH blocks and to know when something is already implemented.
+      const fileContents = collectReferencedFiles(input.messages, Instance.directory)
+      const filesSection = fileContents
+        ? "\n\n# Files in Chat\n\nThese are the current contents of files referenced in the conversation. Read them carefully before making changes — if a feature already exists, say so instead of editing.\n\n" + fileContents
+        : ""
+      system[0] = PROMPT_EDITBLOCK + filesSection + "\n\n" + system[0]
+
+      tools = {}
+    }
 
     // LiteLLM and some Anthropic proxies require the tools parameter to be present
     // when message history contains tool calls, even if no tools are being used.
@@ -164,7 +184,7 @@ export namespace LLM {
       input.model.providerID.toLowerCase().includes("litellm") ||
       input.model.api.id.toLowerCase().includes("litellm")
 
-    if (isLiteLLMProxy && Object.keys(tools).length === 0 && hasToolCalls(input.messages)) {
+    if (isLiteLLMProxy && input.model.capabilities.toolcall && Object.keys(tools).length === 0 && hasToolCalls(input.messages)) {
       tools["_noop"] = tool({
         description:
           "Placeholder for LiteLLM/Anthropic proxy compatibility - required when message history contains tool calls but no active tools are needed",
@@ -204,9 +224,9 @@ export namespace LLM {
       topP: params.topP,
       topK: params.topK,
       providerOptions: ProviderTransform.providerOptions(input.model, params.options),
-      activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
+      activeTools: Object.keys(tools).length > 0 ? Object.keys(tools).filter((x) => x !== "invalid") : undefined,
       tools,
-      toolChoice: input.toolChoice,
+      toolChoice: Object.keys(tools).length > 0 ? (input.toolChoice ?? "auto") : undefined,
       maxOutputTokens,
       abortSignal: input.abort,
       headers: {
@@ -279,5 +299,55 @@ export namespace LLM {
       }
     }
     return false
+  }
+
+  /**
+   * Scan messages for filenames and return their contents for injection into the prompt.
+   * This gives text-mode models accurate file contents for SEARCH blocks.
+   */
+  function collectReferencedFiles(messages: ModelMessage[], projectDir: string): string {
+    const seen = new Set<string>()
+    const results: string[] = []
+
+    // Extract all text from messages
+    const allText: string[] = []
+    for (const msg of messages) {
+      if (typeof msg.content === "string") {
+        allText.push(msg.content)
+      } else if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (part.type === "text") allText.push(part.text)
+        }
+      }
+    }
+
+    const combined = allText.join("\n")
+
+    // Match patterns that look like file paths:
+    // - word.ext (e.g., calculator.ts, greet.ts)
+    // - path/to/file.ext (e.g., src/utils/helper.ts)
+    const filePatterns = combined.match(/(?:[\w./-]+\/)?[\w.-]+\.\w{1,10}/g) ?? []
+
+    for (const raw of filePatterns) {
+      // Skip common non-file patterns
+      if (raw.startsWith("http") || raw.startsWith("www.")) continue
+      if (raw.includes("@") || raw.startsWith(".")) continue
+
+      const abs = nodePath.isAbsolute(raw) ? raw : nodePath.join(projectDir, raw)
+      if (seen.has(abs)) continue
+      seen.add(abs)
+
+      try {
+        const stat = fs.statSync(abs)
+        if (!stat.isFile() || stat.size > 100_000) continue
+        const content = fs.readFileSync(abs, "utf-8")
+        const rel = nodePath.relative(projectDir, abs)
+        results.push(`${rel}\n\`\`\`\n${content}\`\`\``)
+      } catch {
+        // File doesn't exist or can't be read — skip
+      }
+    }
+
+    return results.join("\n\n")
   }
 }

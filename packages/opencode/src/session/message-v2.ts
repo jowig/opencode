@@ -615,6 +615,11 @@ export namespace MessageV2 {
               type: "step-start",
             })
           if (part.type === "tool") {
+            // In text mode, tool parts come from SEARCH/REPLACE edits applied post-stream.
+            // Don't include them as tool-call/tool-result pairs in the model messages —
+            // the model would see them and try to produce tool calls itself, causing errors
+            // since tools={} in text mode.
+            if (!model.capabilities.toolcall) continue
             toolNames.add(part.tool)
             if (part.state.status === "completed") {
               const outputText = part.state.time.compacted ? "[Old tool result content cleared]" : part.state.output

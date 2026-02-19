@@ -15,6 +15,10 @@ import { Config } from "@/config/config"
 import { SessionCompaction } from "./compaction"
 import { PermissionNext } from "@/permission/next"
 import { Question } from "@/question"
+import { applyTextModeEdits, parseEditBlocks, stripEditBlocks } from "./editblock"
+import fs from "fs"
+import nodePath from "path"
+import { Instance } from "@/project/instance"
 
 export namespace SessionProcessor {
   const DOOM_LOOP_THRESHOLD = 3
@@ -49,7 +53,20 @@ export namespace SessionProcessor {
         while (true) {
           try {
             let currentText: MessageV2.TextPart | undefined
+            let completedText = ""
+            let completedTextParts: MessageV2.TextPart[] = []
             let reasoningMap: Record<string, MessageV2.ReasoningPart> = {}
+
+            // Text-mode streaming filter: suppress SEARCH/REPLACE blocks during
+            // streaming so the user only sees chat text. When a block is detected,
+            // emit a brief "editing file.ts..." indicator instead.
+            const isTextMode = !streamInput.model.capabilities.toolcall
+            let blockState: "chat" | "block" = "chat"
+            let lineBuf = "" // accumulates partial lines
+            let blockFilename = "" // last filename seen before a block
+            let lastFenceOrFile = "" // track filename/fence lines to suppress
+            let streamedText = "" // tracks what was actually emitted to the TUI during streaming
+
             const stream = await LLM.stream(streamInput)
 
             for await (const value of stream.fullStream) {
@@ -303,13 +320,79 @@ export namespace SessionProcessor {
                   if (currentText) {
                     currentText.text += value.text
                     if (value.providerMetadata) currentText.metadata = value.providerMetadata
-                    await Session.updatePartDelta({
-                      sessionID: currentText.sessionID,
-                      messageID: currentText.messageID,
-                      partID: currentText.id,
-                      field: "text",
-                      delta: value.text,
-                    })
+
+                    if (!isTextMode) {
+                      // Normal mode: stream everything
+                      await Session.updatePartDelta({
+                        sessionID: currentText.sessionID,
+                        messageID: currentText.messageID,
+                        partID: currentText.id,
+                        field: "text",
+                        delta: value.text,
+                      })
+                    } else {
+                      // Text mode: filter out SEARCH/REPLACE blocks during streaming.
+                      // Buffer text and process complete lines to detect block boundaries.
+                      lineBuf += value.text
+                      let emitBuf = ""
+
+                      while (lineBuf.includes("\n")) {
+                        const nlIdx = lineBuf.indexOf("\n")
+                        const line = lineBuf.slice(0, nlIdx)
+                        lineBuf = lineBuf.slice(nlIdx + 1)
+                        const trimmed = line.trim()
+
+                        if (blockState === "chat") {
+                          // Check if this line starts a SEARCH block
+                          if (/^<{5,9} SEARCH>?\s*$/.test(trimmed)) {
+                            blockState = "block"
+                            // Emit a brief indicator so the user sees activity during block generation
+                            const editLabel = blockFilename || "file"
+                            emitBuf += `Editing ${editLabel}...\n`
+                            continue
+                          }
+                          // Check if this looks like a filename before a fence
+                          if (trimmed && (trimmed.includes(".") || trimmed.includes("/")) && !trimmed.startsWith("```")) {
+                            // Could be a filename — hold it, emit only if next line isn't a fence/SEARCH
+                            lastFenceOrFile = line + "\n"
+                            blockFilename = trimmed
+                            continue
+                          }
+                          if (/^```/.test(trimmed) && lastFenceOrFile) {
+                            // Fence after filename — likely start of edit block, suppress both
+                            lastFenceOrFile = ""
+                            continue
+                          }
+                          // Regular chat line — emit it (and any held filename that wasn't a block)
+                          if (lastFenceOrFile) {
+                            emitBuf += lastFenceOrFile
+                            lastFenceOrFile = ""
+                          }
+                          emitBuf += line + "\n"
+                        } else {
+                          // In block state: suppress everything until >>>>>>> REPLACE
+                          if (/^>{5,9} REPLACE\s*$/.test(trimmed)) {
+                            blockState = "chat"
+                            // Skip optional closing fence on next line
+                            if (lineBuf.startsWith("```")) {
+                              const fenceEnd = lineBuf.indexOf("\n")
+                              lineBuf = fenceEnd >= 0 ? lineBuf.slice(fenceEnd + 1) : ""
+                            }
+                          }
+                        }
+                      }
+
+                      if (emitBuf) {
+                        streamedText += emitBuf
+                        await Session.updatePartDelta({
+                          sessionID: currentText.sessionID,
+                          messageID: currentText.messageID,
+                          partID: currentText.id,
+                          field: "text",
+                          delta: emitBuf,
+                        })
+                      }
+                    }
                   }
                   break
 
@@ -326,12 +409,21 @@ export namespace SessionProcessor {
                       { text: currentText.text },
                     )
                     currentText.text = textOutput.text
-                    currentText.time = {
-                      start: Date.now(),
-                      end: Date.now(),
-                    }
                     if (value.providerMetadata) currentText.metadata = value.providerMetadata
-                    await Session.updatePart(currentText)
+
+                    // In text mode, delay setting time.end and calling updatePart
+                    // until after SEARCH/REPLACE blocks are stripped. The run command
+                    // only prints text parts when time.end is set, so delaying prevents
+                    // raw edit blocks from appearing in output before stripping.
+                    if (streamInput.model.capabilities.toolcall) {
+                      currentText.time = {
+                        start: currentText.time?.start ?? Date.now(),
+                        end: Date.now(),
+                      }
+                      await Session.updatePart(currentText)
+                    }
+                    completedText += currentText.text + "\n"
+                    completedTextParts.push({ ...currentText })
                   }
                   currentText = undefined
                   break
@@ -346,6 +438,161 @@ export namespace SessionProcessor {
                   continue
               }
               if (needsCompaction) break
+            }
+
+            // Text-mode iteration: handle SEARCH/REPLACE blocks and [VIEW] file requests.
+            // After processing, inject a synthetic user message with results/file contents
+            // and set finish="tool-calls" to keep the prompt loop going.
+            if (!streamInput.model.capabilities.toolcall && completedText) {
+              let continueLoop = false
+              const feedbackLines: string[] = []
+
+              // 1. Apply any SEARCH/REPLACE blocks found in the text.
+              const { blocks } = parseEditBlocks(completedText)
+              if (blocks.length > 0) {
+                const results = await applyTextModeEdits({
+                  text: completedText,
+                  assistantMessage: input.assistantMessage,
+                  sessionID: input.sessionID,
+                  abort: input.abort,
+                  messages: [],
+                })
+                feedbackLines.push("## Edit Results", ...results, "")
+                // Only continue the loop if there were errors (so the model can retry).
+                // If all edits succeeded, we're done — no need for another turn.
+                const hasErrors = results.some((r) => r.startsWith("✗") || r.startsWith("Parse error"))
+                if (hasErrors) {
+                  continueLoop = true
+                  // Include current file contents for failed files so the model can retry.
+                  const failedFiles = new Set<string>()
+                  for (const block of blocks) {
+                    const rel = nodePath.relative(Instance.directory, block.filename)
+                    if (results.some((r) => r.startsWith("✗") && r.includes(rel))) {
+                      failedFiles.add(block.filename)
+                    }
+                  }
+                  for (const abs of failedFiles) {
+                    try {
+                      const content = fs.readFileSync(abs, "utf-8")
+                      const rel = nodePath.relative(Instance.directory, abs)
+                      feedbackLines.push(`## Current contents of ${rel}`, "```", content, "```", "")
+                    } catch {}
+                  }
+                  feedbackLines.push("Please output corrected SEARCH/REPLACE blocks to retry the failed edits.")
+                }
+
+                // Strip SEARCH/REPLACE blocks from the displayed text parts so only
+                // the conversational chat remains (the diff shows as a separate tool part).
+                for (const part of completedTextParts) {
+                  const stripped = stripEditBlocks(part.text)
+                  if (stripped !== part.text) {
+                    part.text = stripped
+                  }
+                }
+
+                // Fallback: if stripping left all text parts empty, the model didn't chat.
+                // Preserve what was streamed to the user (e.g. "Editing calculator.ts...")
+                // so completion doesn't blank out the text they already saw.
+                const allEmpty = completedTextParts.every((p) => !p.text.trim())
+                if (allEmpty && completedTextParts.length > 0) {
+                  const trimmedStreamed = streamedText.trim()
+                  if (trimmedStreamed) {
+                    // Keep the text that was shown during streaming
+                    completedTextParts[0].text = trimmedStreamed
+                  } else if (blocks.length > 0) {
+                    // Nothing was streamed either — synthesize a brief description
+                    const descriptions: string[] = []
+                    for (const block of blocks) {
+                      const rel = nodePath.relative(Instance.directory, block.filename)
+                      const normS = block.search.replace(/\s+/g, " ").trim()
+                      const normR = block.replace.replace(/\s+/g, " ").trim()
+                      if (block.search.trim() && normS === normR) {
+                        descriptions.push(`${rel} already has the requested change`)
+                      } else if (!block.search.trim()) {
+                        descriptions.push(`Created ${rel}`)
+                      } else {
+                        descriptions.push(`Edited ${rel}`)
+                      }
+                    }
+                    const unique = [...new Set(descriptions)]
+                    completedTextParts[0].text = unique.join(". ") + "."
+                  }
+                }
+              }
+
+              // Finalize text parts: set time.end and publish the (possibly stripped) text.
+              // This is deferred from text-end so the run command only sees the final version.
+              for (const part of completedTextParts) {
+                if (!part.time?.end) {
+                  part.time = { start: part.time?.start ?? Date.now(), end: Date.now() }
+                }
+                await Session.updatePart(part)
+              }
+
+              // 2. Detect [VIEW path/to/file] requests and inject file contents.
+              const viewRequests = completedText.match(/\[VIEW\s+([^\]]+)\]/g) ?? []
+              for (const match of viewRequests) {
+                const rawPath = match.replace(/\[VIEW\s+/, "").replace(/\]$/, "").trim()
+                const abs = nodePath.isAbsolute(rawPath) ? rawPath : nodePath.join(Instance.directory, rawPath)
+                try {
+                  const content = fs.readFileSync(abs, "utf-8")
+                  const rel = nodePath.relative(Instance.directory, abs)
+                  feedbackLines.push(`## Contents of ${rel}`, "```", content, "```", "")
+                  continueLoop = true
+                } catch {
+                  feedbackLines.push(`## ${rawPath}`, "File not found or could not be read.", "")
+                  continueLoop = true
+                }
+              }
+
+              // 3. Auto-inject files: if the model chatted but produced no edits and no [VIEW],
+              // scan its text for file references and inject their contents. This handles the
+              // case where the model says "I need to see the file" without using [VIEW] syntax.
+              if (!continueLoop && blocks.length === 0 && viewRequests.length === 0) {
+                const fileRefs = completedText.match(/[\w./-]+\.\w{1,10}/g) ?? []
+                const seen = new Set<string>()
+                for (const ref of fileRefs) {
+                  if (seen.has(ref)) continue
+                  seen.add(ref)
+                  const abs = nodePath.isAbsolute(ref) ? ref : nodePath.join(Instance.directory, ref)
+                  try {
+                    const stat = fs.statSync(abs)
+                    if (stat.isFile() && stat.size < 100_000) {
+                      const content = fs.readFileSync(abs, "utf-8")
+                      const rel = nodePath.relative(Instance.directory, abs)
+                      feedbackLines.push(`## Contents of ${rel}`, "```", content, "```", "")
+                      continueLoop = true
+                    }
+                  } catch {}
+                }
+                if (continueLoop) {
+                  feedbackLines.push("The file contents are shown above. Please make the requested changes using SEARCH/REPLACE blocks.")
+                }
+              }
+
+              // 4. If we have feedback, inject a synthetic user message and continue the loop.
+              if (continueLoop && feedbackLines.length > 0) {
+                input.assistantMessage.finish = "tool-calls"
+                await Session.updateMessage(input.assistantMessage)
+
+                const syntheticUser: MessageV2.User = {
+                  id: Identifier.ascending("message"),
+                  sessionID: input.sessionID,
+                  role: "user",
+                  time: { created: Date.now() },
+                  agent: streamInput.user.agent,
+                  model: streamInput.user.model,
+                }
+                await Session.updateMessage(syntheticUser)
+                await Session.updatePart({
+                  id: Identifier.ascending("part"),
+                  messageID: syntheticUser.id,
+                  sessionID: input.sessionID,
+                  type: "text",
+                  text: feedbackLines.join("\n"),
+                  synthetic: true,
+                } satisfies MessageV2.TextPart)
+              }
             }
           } catch (e: any) {
             log.error("process", {
